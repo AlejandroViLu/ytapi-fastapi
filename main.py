@@ -1,18 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-
 import yt_dlp
-import subprocess
-import tempfile
-import os
 import re
-import io
-
 
 app = FastAPI()
 
-# Permitir peticiones desde Android
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,115 +14,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# Limpieza de título
 def clean_title(title: str) -> str:
     title = title.lower()
-    title = re.sub(r"[^\w\s-]", "", title)
-    title = re.sub(r"\s+", "-", title)
-    return title[:50]
-
+    title = re.sub(r'[^\w\s-]', '', title)
+    title = re.sub(r'\s+', '-', title)
+    return title[:60]
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "YT API funcionando en Render!"}
+    return {"status": "ok", "message": "YT API funcionando correctamente"}
 
-
-# --------------------------
-# Obtener metadata
-# --------------------------
 @app.get("/info")
 def get_video_info(url: str):
+
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
         "nocheckcertificate": True,
-        "ignoreerrors": True,
+        "extract_flat": False,
+        "geo_bypass": True,
+        "format": "bestaudio/best"
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            video = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=False)
 
-        title = video.get("title", "Sin título")
-        duration = video.get("duration", 0)
-        thumbnail = video.get("thumbnail", "")
-        formats = video.get("formats", [])
+        if not info:
+            raise HTTPException(status_code=400, detail="No se pudo obtener información del video.")
 
-        audio_formats = [f for f in formats if f.get("acodec") != "none"]
+        title = info.get("title", "Sin titulo")
+        duration = info.get("duration", 0)
+        thumbnail = info.get("thumbnail", "")
+        formats = info.get("formats", [])
 
-        best_audio = max(audio_formats, key=lambda f: f.get("abr", 0))
+        if not formats:
+            raise HTTPException(status_code=400, detail="El video no tiene formatos disponibles.")
+
+        # Filtrar solo formatos de audio
+        audio_formats = [f for f in formats if f.get("acodec") and f["acodec"] != "none"]
+
+        if not audio_formats:
+            raise HTTPException(status_code=400, detail="No se encontraron formatos de audio.")
+
+        # Elegir el mejor formato según bitrate o tamaño
+        best_audio = max(
+            audio_formats,
+            key=lambda f: (f.get("abr") or 0, f.get("filesize") or 0)
+        )
 
         return {
             "title": title,
             "clean_title": clean_title(title),
             "duration": duration,
             "thumbnail": thumbnail,
-            "abr": best_audio.get("abr"),
-            "ext": best_audio.get("ext"),
-            "filesize": best_audio.get("filesize") or best_audio.get("filesize_approx"),
+            "audio_url": best_audio.get("url"),
+            "audio_ext": best_audio.get("ext"),
+            "abr": best_audio.get("abr") or 0,
+            "filesize": best_audio.get("filesize") or best_audio.get("filesize_approx") or 0
         }
 
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error al analizar el video: {str(e)}")
 
-
-# --------------------------
-# Descargar MP3 real
-# --------------------------
 @app.get("/audio")
-def download_audio(url: str):
+def get_audio(url: str):
 
-    # 1) Extraer info
     try:
-        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "format": "bestaudio/best"
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    except:
-        raise HTTPException(400, "No se pudo analizar el video.")
 
-    title = clean_title(info.get("title", "audio"))
-    tmp_dir = tempfile.mkdtemp()
+        if not info:
+            raise HTTPException(status_code=400, detail="No se pudo obtener información del audio.")
 
-    input_audio = os.path.join(tmp_dir, "raw.webm")
-    output_mp3 = os.path.join(tmp_dir, f"{title}.mp3")
+        return {
+            "audio_url": info["url"],
+            "title": info.get("title", "audio")
+        }
 
-    # 2) Descargar audio puro
-    download_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": input_audio,
-        "quiet": True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(download_opts) as ydl:
-            ydl.download([url])
-    except:
-        raise HTTPException(500, "Error al descargar el audio del video.")
-
-    # 3) Convertir a MP3
-    try:
-        subprocess.run(
-            ["ffmpeg", "-i", input_audio, "-vn", "-acodec", "libmp3lame", "-b:a", "192k", output_mp3, "-y"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except:
-        raise HTTPException(500, "Error al convertir el audio a MP3.")
-
-    # 4) Leer MP3 y enviarlo al cliente
-    try:
-        mp3_bytes = open(output_mp3, "rb").read()
-        buffer = io.BytesIO(mp3_bytes)
-
-        return StreamingResponse(
-            buffer,
-            media_type="audio/mpeg",
-            headers={"Content-Disposition": f'attachment; filename="{title}.mp3"'}
-        )
-    finally:
-        try:
-            os.remove(input_audio)
-            os.remove(output_mp3)
-            os.rmdir(tmp_dir)
-        except:
-            pass
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"No se pudo procesar el audio: {str(e)}")
